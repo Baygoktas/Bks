@@ -9,12 +9,11 @@ export default {
     });
   },
 
-  // Otomatik Cron Tetikleyicisi
+  // Otomatik Cron Görevi (TSİ = UTC + 3)
   async scheduled(event, env, ctx) {
     const utcHour = new Date(event.scheduledTime).getUTCHours();
     let task = null;
 
-    // UTC saatine göre ilgili görevi seç (TSİ = UTC + 3)
     if (utcHour === 7) task = "nasa";         // TSİ 10:00
     else if (utcHour === 9) task = "quote";    // TSİ 12:00
     else if (utcHour === 11) task = "vikisoz"; // TSİ 14:00
@@ -57,12 +56,13 @@ async function postNasa(env) {
     let translated = await translate(data.explanation, env);
     if (translated.length > 600) translated = translated.slice(0, 597) + "...";
 
-    const caption = `🌌 <b>GÜNÜN ASTRONOMİ FOTOĞRAFI</b>\n\n🪐 <b>${data.title}</b>\n\n${translated}\n\n📅 <i>${data.date}</i> | <b>Kaynak:</b> NASA`;
+    const webUrl = `https://apod.nasa.gov/apod/ap${data.date.replace(/-/g, "").slice(2)}.html`;
+    const caption = `🌌 <b>GÜNÜN ASTRONOMİ FOTOĞRAFI</b>\n\n🪐 <b>${data.title}</b>\n\n${translated}\n\n📅 <i>${data.date}</i>\n\n🔎 <b>Kaynak:</b> <a href="${webUrl}">NASA APOD</a>`;
 
     let tgRes;
     if (data.media_type === "image") {
       tgRes = await sendPhoto(env, data.hdurl || data.url, caption);
-      if (!tgRes.ok) tgRes = await sendMessage(env, `${caption}\n\n🔗 ${data.url}`);
+      if (!tgRes.ok) tgRes = await sendMessage(env, caption);
     } else {
       tgRes = await sendMessage(env, `${caption}\n\n🎬 <b>Video:</b> ${data.url}`);
     }
@@ -88,7 +88,8 @@ async function postQuote(env) {
       const id = "quote_" + hash(item.q);
       if (!(await env.KV_POSTED.get(id))) {
         const translated = await translate(item.q, env);
-        const text = `📖 <b>GÜNÜN ALINTISI</b>\n\n<i>"${translated}"</i>\n\n✍️ <b>${item.a}</b>`;
+        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(item.a)}`;
+        const text = `📖 <b>GÜNÜN ALINTISI</b>\n\n<i>"${translated}"</i>\n\n✍️ <b>${item.a}</b>\n\n🔎 <b>Kaynak:</b> <a href="${searchUrl}">ZenQuotes / ${item.a}</a>`;
 
         const tgRes = await sendMessage(env, text);
         if (tgRes.ok) {
@@ -111,15 +112,24 @@ async function postVikisoz(env) {
     const data = await res.json();
     const raw = data.parse?.wikitext?.["*"] || "";
 
-    const lines = raw.split("\n").filter((l) => l.includes("''") && !l.startsWith("<!--"));
-    if (lines.length === 0) return { success: false, message: "Ayrıştırma hatası." };
+    const lines = raw.split("\n").filter(l => 
+      l.includes("''") && 
+      !l.startsWith("<!--") && 
+      !l.includes("sayfaların içeriğinde yer alan") &&
+      !l.includes("Günün sözü")
+    );
 
-    const selectedLine = lines[0].replace(/['\[\]]/g, "").trim();
+    let selectedLine = "";
+    if (lines.length > 0) {
+      selectedLine = lines[0].replace(/['\[\]]/g, "").trim();
+    } else {
+      selectedLine = "Akıl akıldan üstündür.";
+    }
+
     const id = "vikisoz_" + hash(selectedLine);
-
     if (await env.KV_POSTED.get(id)) return { success: true, message: "Zaten paylaşıldı." };
 
-    const text = `📜 <b>TÜRKÇE DÜŞÜNCE & EDEBİYAT</b>\n\n"${selectedLine}"\n\n🔎 <b>Kaynak:</b> Vikisöz`;
+    const text = `📜 <b>TÜRKÇE DÜŞÜNCE & EDEBİYAT</b>\n\n"${selectedLine}"\n\n🔎 <b>Kaynak:</b> <a href="https://tr.wikiquote.org/wiki/Vikis%C3%B6z:G%C3%BCn%C3%BCn_s%C3%B6z%C3%BC">Vikisöz Günün Sözü</a>`;
 
     const tgRes = await sendMessage(env, text);
     if (tgRes.ok) {
@@ -132,14 +142,14 @@ async function postVikisoz(env) {
   }
 }
 
-// 4. The Met Museum Sanat Eseri
+// 4. The Met Museum Sanat Eseri (Açıklamalı & Tıklanabilir Kaynaklı)
 async function postArt(env) {
   try {
     const searchRes = await fetch("https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=painting");
     const searchData = await searchRes.json();
     const objectIds = searchData.objectIDs || [];
 
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 20; i++) {
       const randomId = objectIds[Math.floor(Math.random() * objectIds.length)];
       const idKey = `met_${randomId}`;
 
@@ -154,8 +164,21 @@ async function postArt(env) {
       const title = art.title || "İsimsiz Eser";
       const artist = art.artistDisplayName || "Bilinmiyor";
       const year = art.objectDate || "Tarih Belirtilmemiş";
+      const medium = art.medium || "";
+      const museumUrl = art.objectURL || `https://www.metmuseum.org/art/collection/search/${randomId}`;
 
-      const caption = `🎨 <b>SANAT TARİHİNDEN BİR ESER</b>\n\n🖼 <b>Eser:</b> ${title}\n👤 <b>Sanatçı:</b> ${artist}\n📅 <b>Dönem:</b> ${year}\n\n🏛 <b>Müze:</b> The Metropolitan Museum of Art`;
+      // Varsa müzenin eser açıklamasını al, yoksa teknik/kültür bilgisini özetle
+      let rawDescription = "";
+      if (art.creditLine) {
+        rawDescription = `${art.culture ? art.culture + " kültürü. " : ""}${art.medium ? art.medium + " tekniğiyle yapılmıştır. " : ""}${art.repository ? art.repository + " koleksiyonunda yer almaktadır." : ""}`;
+      }
+
+      let translatedDesc = "";
+      if (rawDescription) {
+        translatedDesc = await translate(rawDescription, env);
+      }
+
+      const caption = `🎨 <b>SANAT TARİHİNDEN BİR ESER</b>\n\n🖼 <b>Eser:</b> ${title}\n👤 <b>Sanatçı:</b> ${artist}\n📅 <b>Dönem:</b> ${year}\n${medium ? `🖌 <b>Teknik:</b> ${medium}\n` : ""}${translatedDesc ? `\n📝 <i>${translatedDesc}</i>\n` : ""}\n🔎 <b>Kaynak:</b> <a href="${museumUrl}">The Metropolitan Museum of Art</a>`;
 
       const tgRes = await sendPhoto(env, art.primaryImage, caption);
       if (tgRes.ok) {
@@ -176,15 +199,21 @@ async function postNumbers(env) {
     const month = d.getMonth() + 1;
     const day = d.getDate();
 
-    const res = await fetch(`http://numbersapi.com/${month}/${day}/date`);
-    if (!res.ok) return { success: false };
+    const apiUrl = `https://numbersapi.com/${month}/${day}/date`;
+    const res = await fetch(apiUrl, {
+      headers: { "User-Agent": "TelegramBot/1.0 (https://t.me)" }
+    });
+    
+    if (!res.ok) return { success: false, status: res.status };
     const rawFact = await res.text();
+    if (!rawFact || rawFact.trim().length === 0) return { success: false, message: "Boş yanıt" };
 
     const id = `num_${hash(rawFact)}`;
     if (await env.KV_POSTED.get(id)) return { success: true, message: "Zaten paylaşıldı." };
 
     const translated = await translate(rawFact, env);
-    const text = `🔢 <b>TARİHTE BUGÜN NE OLDU?</b>\n\n📌 ${translated}\n\n🗓 <b>Tarih:</b> ${day}/${month}`;
+    const sourceWebUrl = `https://tr.wikipedia.org/wiki/${day}_${getMonthNameTR(month)}`;
+    const text = `🔢 <b>TARİHTE BUGÜN NE OLDU?</b>\n\n📌 ${translated}\n\n🗓 <b>Tarih:</b> ${day}/${month}\n\n🔎 <b>Kaynak:</b> <a href="${sourceWebUrl}">Vikipedi (${day} ${getMonthNameTR(month)})</a>`;
 
     const tgRes = await sendMessage(env, text);
     if (tgRes.ok) {
@@ -197,7 +226,7 @@ async function postNumbers(env) {
   }
 }
 
-// Çeviri Yardımcısı (Cloudflare Workers AI)
+// Çeviri Motoru
 async function translate(text, env) {
   try {
     const out = await env.AI.run("@cf/meta/m2m100-1.2b", {
@@ -211,6 +240,7 @@ async function translate(text, env) {
   }
 }
 
+// Telegram Mesaj Gönderme (Metin)
 async function sendMessage(env, text) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -226,6 +256,7 @@ async function sendMessage(env, text) {
   ).json();
 }
 
+// Telegram Görsel Gönderme
 async function sendPhoto(env, photo, caption) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
@@ -239,6 +270,11 @@ async function sendPhoto(env, photo, caption) {
       }),
     })
   ).json();
+}
+
+function getMonthNameTR(m) {
+  const months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"];
+  return months[m - 1] || "";
 }
 
 function hash(s) {
