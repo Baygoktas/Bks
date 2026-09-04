@@ -1,5 +1,4 @@
 export default {
-  // Manuel tetikleme veya test için: https://worker-adresi/?type=nasa (veya quote, vikisoz, art, numbers)
   async fetch(request, env) {
     const url = new URL(request.url);
     const type = url.searchParams.get("type");
@@ -9,7 +8,6 @@ export default {
     });
   },
 
-  // Otomatik Cron Görevi (TSİ = UTC + 3)
   async scheduled(event, env, ctx) {
     const utcHour = new Date(event.scheduledTime).getUTCHours();
     let task = null;
@@ -25,6 +23,27 @@ export default {
     }
   },
 };
+
+async function isAlreadyPosted(env, id) {
+  try {
+    if (env.KV_POSTED && typeof env.KV_POSTED.get === "function") {
+      return await env.KV_POSTED.get(id);
+    }
+  } catch (e) {
+    console.error("KV Read Error:", e);
+  }
+  return null;
+}
+
+async function markAsPosted(env, id, ttlSeconds = 2592000) {
+  try {
+    if (env.KV_POSTED && typeof env.KV_POSTED.put === "function") {
+      await env.KV_POSTED.put(id, "true", { expirationTtl: ttlSeconds });
+    }
+  } catch (e) {
+    console.error("KV Write Error:", e);
+  }
+}
 
 async function routeTask(type, env) {
   switch (type) {
@@ -46,12 +65,13 @@ async function routeTask(type, env) {
 // 1. NASA APOD
 async function postNasa(env) {
   try {
-    const res = await fetch(`https://api.nasa.gov/planetary/apod?api_key=${env.NASA_API_KEY || "DEMO_KEY"}`);
+    const apiKey = env.NASA_API_KEY || "DEMO_KEY";
+    const res = await fetch(`https://api.nasa.gov/planetary/apod?api_key=${apiKey}`);
     if (!res.ok) return { success: false, status: res.status };
     const data = await res.json();
 
     const id = `apod_${data.date}`;
-    if (await env.KV_POSTED.get(id)) return { success: true, message: "Zaten paylaşıldı." };
+    if (await isAlreadyPosted(env, id)) return { success: true, message: "Zaten paylaşıldı." };
 
     let translated = await translate(data.explanation, env);
     if (translated.length > 600) translated = translated.slice(0, 597) + "...";
@@ -68,7 +88,7 @@ async function postNasa(env) {
     }
 
     if (tgRes.ok) {
-      await env.KV_POSTED.put(id, "true", { expirationTtl: 60 * 60 * 24 * 365 });
+      await markAsPosted(env, id, 60 * 60 * 24 * 365);
       return { success: true, id };
     }
     return { success: false, error: tgRes };
@@ -81,19 +101,19 @@ async function postNasa(env) {
 async function postQuote(env) {
   try {
     const res = await fetch("https://zenquotes.io/api/quotes");
-    if (!res.ok) return { success: false };
+    if (!res.ok) return { success: false, status: res.status };
     const quotes = await res.json();
 
     for (const item of quotes) {
       const id = "quote_" + hash(item.q);
-      if (!(await env.KV_POSTED.get(id))) {
+      if (!(await isAlreadyPosted(env, id))) {
         const translated = await translate(item.q, env);
         const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(item.a)}`;
         const text = `📖 <b>GÜNÜN ALINTISI</b>\n\n<i>"${translated}"</i>\n\n✍️ <b>${item.a}</b>\n\n🔎 <b>Kaynak:</b> <a href="${searchUrl}">ZenQuotes / ${item.a}</a>`;
 
         const tgRes = await sendMessage(env, text);
         if (tgRes.ok) {
-          await env.KV_POSTED.put(id, "true", { expirationTtl: 60 * 60 * 24 * 90 });
+          await markAsPosted(env, id, 60 * 60 * 24 * 90);
           return { success: true, id };
         }
       }
@@ -119,21 +139,16 @@ async function postVikisoz(env) {
       !l.includes("Günün sözü")
     );
 
-    let selectedLine = "";
-    if (lines.length > 0) {
-      selectedLine = lines[0].replace(/['\[\]]/g, "").trim();
-    } else {
-      selectedLine = "Akıl akıldan üstündür.";
-    }
-
+    let selectedLine = lines.length > 0 ? lines[0].replace(/['\[\]]/g, "").trim() : "Akıl akıldan üstündür.";
     const id = "vikisoz_" + hash(selectedLine);
-    if (await env.KV_POSTED.get(id)) return { success: true, message: "Zaten paylaşıldı." };
+
+    if (await isAlreadyPosted(env, id)) return { success: true, message: "Zaten paylaşıldı." };
 
     const text = `📜 <b>TÜRKÇE DÜŞÜNCE & EDEBİYAT</b>\n\n"${selectedLine}"\n\n🔎 <b>Kaynak:</b> <a href="https://tr.wikiquote.org/wiki/Vikis%C3%B6z:G%C3%BCn%C3%BCn_s%C3%B6z%C3%BC">Vikisöz Günün Sözü</a>`;
 
     const tgRes = await sendMessage(env, text);
     if (tgRes.ok) {
-      await env.KV_POSTED.put(id, "true", { expirationTtl: 60 * 60 * 24 * 60 });
+      await markAsPosted(env, id, 60 * 60 * 24 * 60);
       return { success: true, id };
     }
     return { success: false, error: tgRes };
@@ -142,7 +157,7 @@ async function postVikisoz(env) {
   }
 }
 
-// 4. The Met Museum Sanat Eseri (Açıklamalı & Tıklanabilir Kaynaklı)
+// 4. The Met Museum Sanat Eseri
 async function postArt(env) {
   try {
     const searchRes = await fetch("https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=painting");
@@ -153,7 +168,7 @@ async function postArt(env) {
       const randomId = objectIds[Math.floor(Math.random() * objectIds.length)];
       const idKey = `met_${randomId}`;
 
-      if (await env.KV_POSTED.get(idKey)) continue;
+      if (await isAlreadyPosted(env, idKey)) continue;
 
       const itemRes = await fetch(`https://collectionapi.metmuseum.org/public/collection/v1/objects/${randomId}`);
       if (!itemRes.ok) continue;
@@ -167,10 +182,9 @@ async function postArt(env) {
       const medium = art.medium || "";
       const museumUrl = art.objectURL || `https://www.metmuseum.org/art/collection/search/${randomId}`;
 
-      // Varsa müzenin eser açıklamasını al, yoksa teknik/kültür bilgisini özetle
       let rawDescription = "";
       if (art.creditLine) {
-        rawDescription = `${art.culture ? art.culture + " kültürü. " : ""}${art.medium ? art.medium + " tekniğiyle yapılmıştır. " : ""}${art.repository ? art.repository + " koleksiyonunda yer almaktadır." : ""}`;
+        rawDescription = `${art.culture ? art.culture + " kültürü. " : ""}${art.medium ? art.medium + " tekniği. " : ""}${art.repository ? art.repository + " koleksiyonu." : ""}`;
       }
 
       let translatedDesc = "";
@@ -182,7 +196,7 @@ async function postArt(env) {
 
       const tgRes = await sendPhoto(env, art.primaryImage, caption);
       if (tgRes.ok) {
-        await env.KV_POSTED.put(idKey, "true", { expirationTtl: 60 * 60 * 24 * 180 });
+        await markAsPosted(env, idKey, 60 * 60 * 24 * 180);
         return { success: true, id: idKey };
       }
     }
@@ -199,9 +213,8 @@ async function postNumbers(env) {
     const month = d.getMonth() + 1;
     const day = d.getDate();
 
-    const apiUrl = `https://numbersapi.com/${month}/${day}/date`;
-    const res = await fetch(apiUrl, {
-      headers: { "User-Agent": "TelegramBot/1.0 (https://t.me)" }
+    const res = await fetch(`https://numbersapi.com/${month}/${day}/date`, {
+      headers: { "User-Agent": "TelegramBot/1.0" }
     });
     
     if (!res.ok) return { success: false, status: res.status };
@@ -209,7 +222,7 @@ async function postNumbers(env) {
     if (!rawFact || rawFact.trim().length === 0) return { success: false, message: "Boş yanıt" };
 
     const id = `num_${hash(rawFact)}`;
-    if (await env.KV_POSTED.get(id)) return { success: true, message: "Zaten paylaşıldı." };
+    if (await isAlreadyPosted(env, id)) return { success: true, message: "Zaten paylaşıldı." };
 
     const translated = await translate(rawFact, env);
     const sourceWebUrl = `https://tr.wikipedia.org/wiki/${day}_${getMonthNameTR(month)}`;
@@ -217,7 +230,7 @@ async function postNumbers(env) {
 
     const tgRes = await sendMessage(env, text);
     if (tgRes.ok) {
-      await env.KV_POSTED.put(id, "true", { expirationTtl: 60 * 60 * 24 * 60 });
+      await markAsPosted(env, id, 60 * 60 * 24 * 60);
       return { success: true, id };
     }
     return { success: false, error: tgRes };
@@ -226,9 +239,9 @@ async function postNumbers(env) {
   }
 }
 
-// Çeviri Motoru
 async function translate(text, env) {
   try {
+    if (!env.AI) return text;
     const out = await env.AI.run("@cf/meta/m2m100-1.2b", {
       text: text,
       source_lang: "english",
@@ -240,7 +253,6 @@ async function translate(text, env) {
   }
 }
 
-// Telegram Mesaj Gönderme (Metin)
 async function sendMessage(env, text) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -256,7 +268,6 @@ async function sendMessage(env, text) {
   ).json();
 }
 
-// Telegram Görsel Gönderme
 async function sendPhoto(env, photo, caption) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
