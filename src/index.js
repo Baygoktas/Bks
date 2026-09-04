@@ -1,5 +1,4 @@
 export default {
-  // Manuel test linki: https://worker-adresi/?type=nasa (veya quote, vikisoz, art, numbers)
   async fetch(request, env) {
     const url = new URL(request.url);
     const type = url.searchParams.get("type");
@@ -9,7 +8,6 @@ export default {
     });
   },
 
-  // Otomatik Cron Görevleri (TSİ = UTC + 3)
   async scheduled(event, env, ctx) {
     const utcHour = new Date(event.scheduledTime).getUTCHours();
     let task = null;
@@ -26,26 +24,18 @@ export default {
   },
 };
 
-// Güvenli KV Okuma
-async function isAlreadyPosted(env, id) {
-  try {
-    if (env.KV_POSTED && typeof env.KV_POSTED.get === "function") {
-      return await env.KV_POSTED.get(id);
-    }
-  } catch (e) {
-    console.error("KV Read Error:", e);
+// KV kontrolü: Bağlantı yoksa hata fırlatır, mesajın mükerrer atılmasını engeller
+async function checkPosted(env, id) {
+  if (!env.KV_POSTED) {
+    throw new Error("KV_POSTED bağlantısı bulunamadı! Cloudflare panelinden Settings > Bindings altını kontrol edin.");
   }
-  return null;
+  const val = await env.KV_POSTED.get(id);
+  return val !== null;
 }
 
-// Güvenli KV Yazma
-async function markAsPosted(env, id, ttlSeconds = 2592000) {
-  try {
-    if (env.KV_POSTED && typeof env.KV_POSTED.put === "function") {
-      await env.KV_POSTED.put(id, "true", { expirationTtl: ttlSeconds });
-    }
-  } catch (e) {
-    console.error("KV Write Error:", e);
+async function markPosted(env, id, ttlSeconds = 2592000) {
+  if (env.KV_POSTED) {
+    await env.KV_POSTED.put(id, "true", { expirationTtl: ttlSeconds });
   }
 }
 
@@ -75,7 +65,7 @@ async function postNasa(env) {
     const data = await res.json();
 
     const id = `apod_${data.date}`;
-    if (await isAlreadyPosted(env, id)) return { success: true, message: "Zaten paylaşıldı." };
+    if (await checkPosted(env, id)) return { success: true, message: "Bu içerik zaten paylaşıldı." };
 
     let translated = await translate(data.explanation, env);
     if (translated.length > 600) translated = translated.slice(0, 597) + "...";
@@ -92,7 +82,7 @@ async function postNasa(env) {
     }
 
     if (tgRes.ok) {
-      await markAsPosted(env, id, 60 * 60 * 24 * 365);
+      await markPosted(env, id, 60 * 60 * 24 * 365);
       return { success: true, id };
     }
     return { success: false, error: tgRes };
@@ -101,7 +91,7 @@ async function postNasa(env) {
   }
 }
 
-// 2. ZenQuotes Edebi Alıntı
+// 2. ZenQuotes
 async function postQuote(env) {
   try {
     const res = await fetch("https://zenquotes.io/api/quotes");
@@ -110,19 +100,19 @@ async function postQuote(env) {
 
     for (const item of quotes) {
       const id = "quote_" + hash(item.q);
-      if (!(await isAlreadyPosted(env, id))) {
+      if (!(await checkPosted(env, id))) {
         const translated = await translate(item.q, env);
         const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(item.a)}`;
         const text = `📖 <b>GÜNÜN ALINTISI</b>\n\n<i>"${translated}"</i>\n\n✍️ <b>${item.a}</b>\n\n🔎 <b>Kaynak:</b> <a href="${searchUrl}">ZenQuotes / ${item.a}</a>`;
 
         const tgRes = await sendMessage(env, text);
         if (tgRes.ok) {
-          await markAsPosted(env, id, 60 * 60 * 24 * 90);
+          await markPosted(env, id, 60 * 60 * 24 * 90);
           return { success: true, id };
         }
       }
     }
-    return { success: false, message: "Yeni alıntı bulunamadı." };
+    return { success: false, message: "Paylaşılacak yeni alıntı bulunamadı." };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -146,13 +136,13 @@ async function postVikisoz(env) {
     let selectedLine = lines.length > 0 ? lines[0].replace(/['\[\]]/g, "").trim() : "Akıl akıldan üstündür.";
     const id = "vikisoz_" + hash(selectedLine);
 
-    if (await isAlreadyPosted(env, id)) return { success: true, message: "Zaten paylaşıldı." };
+    if (await checkPosted(env, id)) return { success: true, message: "Bu içerik zaten paylaşıldı." };
 
     const text = `📜 <b>TÜRKÇE DÜŞÜNCE & EDEBİYAT</b>\n\n"${selectedLine}"\n\n🔎 <b>Kaynak:</b> <a href="https://tr.wikiquote.org/wiki/Vikis%C3%B6z:G%C3%BCn%C3%BCn_s%C3%B6z%C3%BC">Vikisöz Günün Sözü</a>`;
 
     const tgRes = await sendMessage(env, text);
     if (tgRes.ok) {
-      await markAsPosted(env, id, 60 * 60 * 24 * 60);
+      await markPosted(env, id, 60 * 60 * 24 * 60);
       return { success: true, id };
     }
     return { success: false, error: tgRes };
@@ -161,18 +151,18 @@ async function postVikisoz(env) {
   }
 }
 
-// 4. The Met Museum Sanat Eseri
+// 4. The Met Museum
 async function postArt(env) {
   try {
     const searchRes = await fetch("https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=painting");
     const searchData = await searchRes.json();
     const objectIds = searchData.objectIDs || [];
 
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 25; i++) {
       const randomId = objectIds[Math.floor(Math.random() * objectIds.length)];
       const idKey = `met_${randomId}`;
 
-      if (await isAlreadyPosted(env, idKey)) continue;
+      if (await checkPosted(env, idKey)) continue;
 
       const itemRes = await fetch(`https://collectionapi.metmuseum.org/public/collection/v1/objects/${randomId}`);
       if (!itemRes.ok) continue;
@@ -200,17 +190,17 @@ async function postArt(env) {
 
       const tgRes = await sendPhoto(env, art.primaryImage, caption);
       if (tgRes.ok) {
-        await markAsPosted(env, idKey, 60 * 60 * 24 * 180);
+        await markPosted(env, idKey, 60 * 60 * 24 * 180);
         return { success: true, id: idKey };
       }
     }
-    return { success: false, message: "Yeni tablo bulunamadı." };
+    return { success: false, message: "Paylaşılacak yeni tablo bulunamadı." };
   } catch (e) {
     return { success: false, error: e.message };
   }
 }
 
-// 5. Tarihte Bugün (Wikimedia TR - 526 Hatası Vermez)
+// 5. Tarihte Bugün (Vikipedi TR)
 async function postNumbers(env) {
   try {
     const d = new Date();
@@ -231,36 +221,40 @@ async function postNumbers(env) {
     }
 
     for (const item of selectedList) {
+      // Olay metnini ve yılını hashleyerek benzersiz ID üret
       const id = `hist_${item.year}_${hash(item.text)}`;
-      if (!(await isAlreadyPosted(env, id))) {
-        const page = item.pages?.[0];
-        const pageUrl = page?.content_urls?.desktop?.page || `https://tr.wikipedia.org/wiki/${d.getDate()}_${getMonthNameTR(d.getMonth() + 1)}`;
-        const photoUrl = page?.thumbnail?.source || null;
+      
+      // Zaten atıldıysa bu olayı atla, listedeki diğer olaya geç
+      if (await checkPosted(env, id)) {
+        continue;
+      }
 
-        const caption = `🔢 <b>TARİHTE BUGÜN NE OLDU?</b>\n\n🗓 <b>Yıl:</b> ${item.year}\n📌 ${item.text}\n\n🔎 <b>Kaynak:</b> <a href="${pageUrl}">Vikipedi (Tarihte Bugün)</a>`;
+      const page = item.pages?.[0];
+      const pageUrl = page?.content_urls?.desktop?.page || `https://tr.wikipedia.org/wiki/${d.getDate()}_${getMonthNameTR(d.getMonth() + 1)}`;
+      const photoUrl = page?.thumbnail?.source || null;
 
-        let tgRes;
-        if (photoUrl) {
-          tgRes = await sendPhoto(env, photoUrl, caption);
-          if (!tgRes.ok) tgRes = await sendMessage(env, caption);
-        } else {
-          tgRes = await sendMessage(env, caption);
-        }
+      const caption = `🔢 <b>TARİHTE BUGÜN NE OLDU?</b>\n\n🗓 <b>Yıl:</b> ${item.year}\n📌 ${item.text}\n\n🔎 <b>Kaynak:</b> <a href="${pageUrl}">Vikipedi (Tarihte Bugün)</a>`;
 
-        if (tgRes.ok) {
-          await markAsPosted(env, id, 60 * 60 * 24 * 90);
-          return { success: true, id };
-        }
+      let tgRes;
+      if (photoUrl) {
+        tgRes = await sendPhoto(env, photoUrl, caption);
+        if (!tgRes.ok) tgRes = await sendMessage(env, caption);
+      } else {
+        tgRes = await sendMessage(env, caption);
+      }
+
+      if (tgRes.ok) {
+        await markPosted(env, id, 60 * 60 * 24 * 90);
+        return { success: true, id };
       }
     }
 
-    return { success: false, message: "Tüm olaylar daha önce paylaşılmış." };
+    return { success: true, message: "Bugüne ait tüm olaylar zaten paylaşılmış." };
   } catch (e) {
     return { success: false, error: e.message };
   }
 }
 
-// Çeviri Motoru
 async function translate(text, env) {
   try {
     if (!env.AI) return text;
@@ -275,7 +269,6 @@ async function translate(text, env) {
   }
 }
 
-// Telegram Mesaj Gönderme (Metin)
 async function sendMessage(env, text) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -291,7 +284,6 @@ async function sendMessage(env, text) {
   ).json();
 }
 
-// Telegram Görsel Gönderme
 async function sendPhoto(env, photo, caption) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
