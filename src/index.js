@@ -1,4 +1,5 @@
 export default {
+  // Manuel test linki: https://worker-adresi/?type=nasa (veya quote, vikisoz, art, numbers)
   async fetch(request, env) {
     const url = new URL(request.url);
     const type = url.searchParams.get("type");
@@ -8,6 +9,7 @@ export default {
     });
   },
 
+  // Otomatik Cron Görevleri (TSİ = UTC + 3)
   async scheduled(event, env, ctx) {
     const utcHour = new Date(event.scheduledTime).getUTCHours();
     let task = null;
@@ -24,6 +26,7 @@ export default {
   },
 };
 
+// Güvenli KV Okuma
 async function isAlreadyPosted(env, id) {
   try {
     if (env.KV_POSTED && typeof env.KV_POSTED.get === "function") {
@@ -35,6 +38,7 @@ async function isAlreadyPosted(env, id) {
   return null;
 }
 
+// Güvenli KV Yazma
 async function markAsPosted(env, id, ttlSeconds = 2592000) {
   try {
     if (env.KV_POSTED && typeof env.KV_POSTED.put === "function") {
@@ -58,7 +62,7 @@ async function routeTask(type, env) {
     case "numbers":
       return await postNumbers(env);
     default:
-      return { success: false, message: "Geçerli bir tür belirtilmedi (nasa, quote, vikisoz, art, numbers)." };
+      return { success: false, message: "Geçerli bir parametre girin: nasa, quote, vikisoz, art, numbers" };
   }
 }
 
@@ -206,39 +210,57 @@ async function postArt(env) {
   }
 }
 
-// 5. Numbers API (Tarihte Bugün)
+// 5. Tarihte Bugün (Wikimedia TR - 526 Hatası Vermez)
 async function postNumbers(env) {
   try {
     const d = new Date();
-    const month = d.getMonth() + 1;
-    const day = d.getDate();
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
 
-    const res = await fetch(`https://numbersapi.com/${month}/${day}/date`, {
-      headers: { "User-Agent": "TelegramBot/1.0" }
+    const apiUrl = `https://api.wikimedia.org/feed/v1/wikipedia/tr/onthisday/selected/${month}/${day}`;
+    const res = await fetch(apiUrl, {
+      headers: { "User-Agent": "TelegramKulturBot/1.0 (admin@example.com)" },
     });
-    
+
     if (!res.ok) return { success: false, status: res.status };
-    const rawFact = await res.text();
-    if (!rawFact || rawFact.trim().length === 0) return { success: false, message: "Boş yanıt" };
+    const data = await res.json();
+    const selectedList = data.selected || [];
 
-    const id = `num_${hash(rawFact)}`;
-    if (await isAlreadyPosted(env, id)) return { success: true, message: "Zaten paylaşıldı." };
-
-    const translated = await translate(rawFact, env);
-    const sourceWebUrl = `https://tr.wikipedia.org/wiki/${day}_${getMonthNameTR(month)}`;
-    const text = `🔢 <b>TARİHTE BUGÜN NE OLDU?</b>\n\n📌 ${translated}\n\n🗓 <b>Tarih:</b> ${day}/${month}\n\n🔎 <b>Kaynak:</b> <a href="${sourceWebUrl}">Vikipedi (${day} ${getMonthNameTR(month)})</a>`;
-
-    const tgRes = await sendMessage(env, text);
-    if (tgRes.ok) {
-      await markAsPosted(env, id, 60 * 60 * 24 * 60);
-      return { success: true, id };
+    if (selectedList.length === 0) {
+      return { success: false, message: "Tarihte bugün verisi bulunamadı." };
     }
-    return { success: false, error: tgRes };
+
+    for (const item of selectedList) {
+      const id = `hist_${item.year}_${hash(item.text)}`;
+      if (!(await isAlreadyPosted(env, id))) {
+        const page = item.pages?.[0];
+        const pageUrl = page?.content_urls?.desktop?.page || `https://tr.wikipedia.org/wiki/${d.getDate()}_${getMonthNameTR(d.getMonth() + 1)}`;
+        const photoUrl = page?.thumbnail?.source || null;
+
+        const caption = `🔢 <b>TARİHTE BUGÜN NE OLDU?</b>\n\n🗓 <b>Yıl:</b> ${item.year}\n📌 ${item.text}\n\n🔎 <b>Kaynak:</b> <a href="${pageUrl}">Vikipedi (Tarihte Bugün)</a>`;
+
+        let tgRes;
+        if (photoUrl) {
+          tgRes = await sendPhoto(env, photoUrl, caption);
+          if (!tgRes.ok) tgRes = await sendMessage(env, caption);
+        } else {
+          tgRes = await sendMessage(env, caption);
+        }
+
+        if (tgRes.ok) {
+          await markAsPosted(env, id, 60 * 60 * 24 * 90);
+          return { success: true, id };
+        }
+      }
+    }
+
+    return { success: false, message: "Tüm olaylar daha önce paylaşılmış." };
   } catch (e) {
     return { success: false, error: e.message };
   }
 }
 
+// Çeviri Motoru
 async function translate(text, env) {
   try {
     if (!env.AI) return text;
@@ -253,6 +275,7 @@ async function translate(text, env) {
   }
 }
 
+// Telegram Mesaj Gönderme (Metin)
 async function sendMessage(env, text) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -268,6 +291,7 @@ async function sendMessage(env, text) {
   ).json();
 }
 
+// Telegram Görsel Gönderme
 async function sendPhoto(env, photo, caption) {
   return (
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
